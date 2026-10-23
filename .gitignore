@@ -1,0 +1,32 @@
+# ESP-IDF build output
+build/
+**/build/
+
+# VS Code
+.vscode/
+
+# ESP-IDF generated files
+sdkconfig.old
+
+# Python
+__pycache__/
+*.pyc
+
+# C/C++ generated files
+*.o
+*.a
+*.obj
+*.d
+*.gcda
+*.gcno
+*.pdb
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+# OS files
+.DS_Store
+Thumbs.db
