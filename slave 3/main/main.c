@@ -1,10 +1,10 @@
 /*
  * ============================================================
- *  ESP32 MULTI-SENSOR DATA COLLECTION
+ *  ESP32 "SLAVE 3" - 2x IR TEMPERATURE + LIDAR + PRESSURE, OVER CAN
  * ============================================================
  *
  *  Board : ESP32-WROOM-32 DevKit
- *  SDK   : ESP-IDF v5.2 or newer (new i2c_master driver)
+ *  SDK   : ESP-IDF v5.5+ / v6.x
  *
  *  SENSORS
  *    1. GY-906 (MLX90614) #1   - IR temperature   - I2C bus 0 - 0x5A
@@ -12,42 +12,94 @@
  *    3. GY-906 (MLX90614) #2   - IR temperature   - I2C bus 1 - 0x5A
  *    4. Hydraulic pressure sensor (0.5-4.5 V)     - ADC1_CH6
  *
+ *  OUTPUT
+ *    - Three CAN frames every 100 ms (10 Hz), 500 kbit/s
+ *    - The same values printed on the serial monitor
+ *
+ * ------------------------------------------------------------
+ *  FIRST-TIME PROJECT SETUP
+ * ------------------------------------------------------------
+ *  This is a single-file project: main.c is the only source file.
+ *
+ *  main/CMakeLists.txt must contain (note the added esp_driver_twai):
+ *
+ *      idf_component_register(SRCS "main.c"
+ *                             INCLUDE_DIRS "."
+ *                             PRIV_REQUIRES esp_driver_i2c esp_driver_gpio
+ *                                           esp_driver_twai esp_adc)
+ *
+ *  Then:  idf.py set-target esp32
+ *         idf.py build
+ *         idf.py -p <PORT> flash monitor
+ *
+ * ------------------------------------------------------------
  *  WHY TWO I2C BUSES?
- *    Both GY-906 modules ship with address 0x5A. Putting each one on
- *    its own bus lets both keep the default address, so no sensor
- *    needs to be reprogrammed.
+ * ------------------------------------------------------------
+ *  Both GY-906 modules ship with address 0x5A. Putting each one on
+ *  its own bus lets both keep the default address, so no sensor
+ *  needs to be reprogrammed.
  *
+ * ------------------------------------------------------------
  *  WIRING
- *    I2C bus 0 : GPIO21 = SDA, GPIO22 = SCL  -> GY-906 #1, VL53L0X
- *    I2C bus 1 : GPIO25 = SDA, GPIO26 = SCL  -> GY-906 #2
- *    Pressure  : GPIO34 (ADC1_CH6, input only)
+ * ------------------------------------------------------------
+ *  I2C bus 0 : GPIO21 = SDA, GPIO22 = SCL  -> GY-906 #1, VL53L0X
+ *  I2C bus 1 : GPIO25 = SDA, GPIO26 = SCL  -> GY-906 #2
+ *  Pressure  : GPIO34 (ADC1_CH6, input only)
+ *  CAN       : GPIO5 = TX, GPIO4 = RX      -> CAN transceiver
  *
- *    Power for all three I2C modules: ESP32 3V3 and GND.
+ *  Power for all three I2C modules: ESP32 3V3 and GND.
  *
- *    Pressure sensor:
- *      VCC -> external 5 V supply
- *      GND -> ESP32 GND  (MUST be common ground)
- *      OUT -> 10k -> GPIO34 -> 20k -> GND
+ *  Pressure sensor:
+ *    VCC -> external 5 V supply
+ *    GND -> ESP32 GND  (MUST be common ground)
+ *    OUT -> 10k -> GPIO34 -> 20k -> GND
  *
- *      ADC voltage = sensor voltage x 20k / (10k + 20k) = sensor / 1.5
- *      4.5 V at the sensor -> 3.0 V at the ESP32 pin.
+ *    ADC voltage = sensor voltage x 20k / (10k + 20k) = sensor / 1.5
+ *    4.5 V at the sensor -> 3.0 V at the ESP32 pin.
  *
- *  SERIAL OUTPUT (one line every 500 ms)
- *    PACKET | T1_AMB=.. C | T1_OBJ=.. C | T2_AMB=.. C | T2_OBJ=.. C |
- *             LIDAR=.. mm | PRESSURE=.. Pa
+ *  CAN (TWAI) - needs an external 3.3 V CAN transceiver
+ *    GPIO 5 -> transceiver TXD
+ *    GPIO 4 -> transceiver RXD
+ *    CANH / CANL -> bus, with 120 ohm termination at each END of the bus
  *
- *    Error values:  temperature = -999.00   lidar = -1
+ * ------------------------------------------------------------
+ *  CAN FRAMES (all values big-endian, standard 11-bit IDs, 8 bytes)
+ * ------------------------------------------------------------
+ *  0x300  bytes 0-1 T1 ambient x100 (int16) | 2-3 T1 object x100 (int16)
+ *         bytes 4-5 T2 ambient x100 (int16) | 6-7 T2 object x100 (int16)
+ *         Invalid temperature = -32768 (0x8000). Values are clamped to
+ *         +-327.67 C.
+ *
+ *  0x301  bytes 0-1 LiDAR distance in mm (uint16, 0xFFFF = invalid)
+ *         bytes 2-5 pressure in Pa (uint32, 0xFFFFFFFF = invalid)
+ *         bytes 6-7 sequence number (uint16)
+ *
+ *  0x302  byte 0 status: bit0 = GY-906 #1 OK, bit1 = GY-906 #2 OK,
+ *                        bit2 = LiDAR OK,     bit3 = pressure ADC OK
+ *         bytes 1-7 reserved (0)
+ *
+ * ------------------------------------------------------------
+ *  SERIAL OUTPUT (one line every 100 ms)
+ * ------------------------------------------------------------
+ *  PACKET | T1_AMB=.. C | T1_OBJ=.. C | T2_AMB=.. C | T2_OBJ=.. C |
+ *           LIDAR=.. mm | PRESSURE=.. Pa | CAN=ok/ERR
+ *
+ *  Error values:  temperature = -999.00   lidar = -1   pressure = -1
  * ============================================================
  */
 
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
+#include "esp_twai.h"
+#include "esp_twai_onchip.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -88,8 +140,21 @@
 /* Divider: 10k (top) + 20k (bottom) -> ratio 1.5 */
 #define DIVIDER_RATIO           1.5f
 
+/* CAN (TWAI) */
+#define CAN_TX_GPIO             GPIO_NUM_5
+#define CAN_RX_GPIO             GPIO_NUM_4
+#define CAN_BITRATE             500000
+
+#define CAN_ID_TEMPERATURES     0x300
+#define CAN_ID_DIST_PRESSURE    0x301
+#define CAN_ID_STATUS           0x302
+
+#define TEMP_INVALID            ((int16_t)-32768)
+#define DIST_INVALID            0xFFFF
+#define PRESSURE_INVALID        0xFFFFFFFFu
+
 #define I2C_TIMEOUT_MS          100
-#define LOOP_PERIOD_MS          500
+#define LOOP_PERIOD_MS          100     /* 10 Hz */
 
 #define CHECK(x)                                    \
     do {                                            \
@@ -118,6 +183,9 @@ static bool                      adc_calibrated;
 
 static uint8_t lidar_stop_var;
 static bool    lidar_ready;
+
+static twai_node_handle_t can_node;
+static bool               can_ok = false;
 
 /* ============================================================
  * I2C SETUP
@@ -429,6 +497,68 @@ static void check_sensors(void)
 }
 
 /* ============================================================
+ * CAN (TWAI)
+ * ============================================================ */
+
+static void put_be16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = (uint8_t)(value >> 8);
+    dst[1] = (uint8_t)(value & 0xFF);
+}
+
+static void put_be32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)(value >> 24);
+    dst[1] = (uint8_t)(value >> 16);
+    dst[2] = (uint8_t)(value >> 8);
+    dst[3] = (uint8_t)(value & 0xFF);
+}
+
+/* Temperature in C -> int16 in hundredths of a degree.
+ * Clamped to +-327.67 C so it never collides with TEMP_INVALID. */
+static int16_t temp_x100(float celsius)
+{
+    float scaled = roundf(celsius * 100.0f);
+    if (scaled > 32767.0f)  return 32767;
+    if (scaled < -32767.0f) return -32767;
+    return (int16_t)scaled;
+}
+
+static bool init_can(void)
+{
+    twai_onchip_node_config_t node_cfg = {
+        .io_cfg.tx = CAN_TX_GPIO,
+        .io_cfg.rx = CAN_RX_GPIO,
+        .bit_timing.bitrate = CAN_BITRATE,
+        .tx_queue_depth = 6,
+    };
+
+    esp_err_t err = twai_new_node_onchip(&node_cfg, &can_node);
+    if (err == ESP_OK) {
+        err = twai_node_enable(can_node);
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "CAN init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "CAN started at %d kbit/s", CAN_BITRATE / 1000);
+    return true;
+}
+
+/* 'data' must stay valid until the frame is sent, so callers pass static buffers. */
+static esp_err_t can_send(uint32_t id, uint8_t *data)
+{
+    twai_frame_t frame = {
+        .header.id = id,
+        .buffer = data,
+        .buffer_len = 8,
+    };
+    return twai_node_transmit(can_node, &frame, 0);
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -441,7 +571,9 @@ void app_main(void)
            I2C0_SDA_PIN, I2C0_SCL_PIN);
     printf("I2C bus 1 : SDA=GPIO%d  SCL=GPIO%d  (GY-906 #2)\n",
            I2C1_SDA_PIN, I2C1_SCL_PIN);
-    printf("Pressure  : GPIO%d (ADC1_CH6)\n\n", PRESSURE_ADC_GPIO);
+    printf("Pressure  : GPIO%d (ADC1_CH6)\n", PRESSURE_ADC_GPIO);
+    printf("CAN       : TX=GPIO%d  RX=GPIO%d  %d kbit/s\n\n",
+           (int)CAN_TX_GPIO, (int)CAN_RX_GPIO, CAN_BITRATE / 1000);
 
     i2c_init();
     pressure_init();
@@ -463,28 +595,74 @@ void app_main(void)
                  model_id);
     }
 
+    can_ok = init_can();
+
     printf("\n============================================================\n");
     printf("                      SENSOR PACKETS\n");
     printf("============================================================\n");
 
+    uint16_t seq = 0;
+
+    /* Static so they stay valid while queued for transmission */
+    static uint8_t frame_temps[8];
+    static uint8_t frame_dist_press[8];
+    static uint8_t frame_status[8];
+
     while (1) {
+        seq++;
+
         float t1_amb = 0, t1_obj = 0;
         float t2_amb = 0, t2_obj = 0;
 
         bool t1_ok = read_temperature(temp1_handle, &t1_amb, &t1_obj);
         bool t2_ok = read_temperature(temp2_handle, &t2_amb, &t2_obj);
 
-        int   distance_mm  = lidar_read_distance();
-        float pressure_pa  = pressure_read();
+        int   distance_mm = lidar_read_distance();
+        float pressure_pa = pressure_read();
+
+        bool lidar_valid    = (distance_mm >= 0);
+        bool pressure_valid = (pressure_pa >= 0.0f);
+
+        /* ----- Frame 0x300: temperatures ----- */
+        put_be16(&frame_temps[0], (uint16_t)(t1_ok ? temp_x100(t1_amb) : TEMP_INVALID));
+        put_be16(&frame_temps[2], (uint16_t)(t1_ok ? temp_x100(t1_obj) : TEMP_INVALID));
+        put_be16(&frame_temps[4], (uint16_t)(t2_ok ? temp_x100(t2_amb) : TEMP_INVALID));
+        put_be16(&frame_temps[6], (uint16_t)(t2_ok ? temp_x100(t2_obj) : TEMP_INVALID));
+
+        /* ----- Frame 0x301: distance + pressure + sequence ----- */
+        put_be16(&frame_dist_press[0],
+                 lidar_valid ? (uint16_t)distance_mm : (uint16_t)DIST_INVALID);
+        put_be32(&frame_dist_press[2],
+                 pressure_valid ? (uint32_t)(pressure_pa + 0.5f) : PRESSURE_INVALID);
+        put_be16(&frame_dist_press[6], seq);
+
+        /* ----- Frame 0x302: status ----- */
+        frame_status[0] = (t1_ok ? 0x01 : 0x00) |
+                          (t2_ok ? 0x02 : 0x00) |
+                          (lidar_valid ? 0x04 : 0x00) |
+                          (pressure_valid ? 0x08 : 0x00);
+        for (int i = 1; i < 8; i++) {
+            frame_status[i] = 0;
+        }
+
+        /* ----- Transmit ----- */
+        bool can_sent = false;
+        if (can_ok) {
+            esp_err_t e1 = can_send(CAN_ID_TEMPERATURES, frame_temps);
+            esp_err_t e2 = can_send(CAN_ID_DIST_PRESSURE, frame_dist_press);
+            esp_err_t e3 = can_send(CAN_ID_STATUS, frame_status);
+            can_sent = (e1 == ESP_OK) && (e2 == ESP_OK) && (e3 == ESP_OK);
+        }
 
         printf("PACKET | "
                "T1_AMB=%.2f C | T1_OBJ=%.2f C | "
                "T2_AMB=%.2f C | T2_OBJ=%.2f C | "
-               "LIDAR=%d mm | PRESSURE=%.0f Pa\n",
+               "LIDAR=%d mm | PRESSURE=%.0f Pa | CAN=%s\n",
                t1_ok ? t1_amb : -999.0f, t1_ok ? t1_obj : -999.0f,
                t2_ok ? t2_amb : -999.0f, t2_ok ? t2_obj : -999.0f,
                distance_mm,
-               pressure_pa);
+               pressure_pa,
+               can_sent ? "ok" : "ERR");
 
         vTaskDelay(pdMS_TO_TICKS(LOOP_PERIOD_MS));
     }
