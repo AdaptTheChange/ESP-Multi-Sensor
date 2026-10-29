@@ -21,24 +21,22 @@ is still alive.
 
 ## 1. System overview
 
-```
- +-----------+   +-----------+   +-----------+   +-----------+
- |  Slave 1  |   |  Slave 2  |   |  Slave 3  |   |  Slave 4  |
- | IMU, Hall |   |  ADS1113  |   | 2x IR temp|   | 2x PT100  |
- | 2x PT100  |   |   ADC     |   | LiDAR,    |   | Hall,     |
- |           |   |           |   | pressure  |   | LiDAR     |
- +-----+-----+   +-----+-----+   +-----+-----+   +-----+-----+
-       |               |               |               |
-    [CAN XCVR]      [CAN XCVR]      [CAN XCVR]      [CAN XCVR]
-       |               |               |               |
- ======+===============+===============+===============+======= CAN bus
-                                       |                (CANH / CANL)
-                                  [CAN XCVR]
-                                       |
-                                 +-----+-----+
-                                 |  MASTER   |  decode + print + monitor
-                                 +-----------+
-```
++-----------+  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+
+|  Slave 1  |  |  Slave 2  |  |  Slave 3  |  |  Slave 4  |  |  HV BMS   |  |  LV BMS   |
+| IMU, Hall |  |  ADS1113  |  |2x IR temp |  | 2x PT100  |  | High Volt |  | Low Volt  |
+| 2x PT100  |  |    ADC    |  |LiDAR, pres|  |Hall, LiDAR|  | Pack Mgmt |  | System Mgm|
++-----------+  +-----------+  +-----------+  +-----------+  +-----------+  +-----------+
+      |              |              |              |              |              |
+  [CAN XCVR]     [CAN XCVR]     [CAN XCVR]     [CAN XCVR]         |              |
+      |              |              |              |              |              |
+======+==============+==============+==============+==============+==============+======= CAN bus
+                                                                                 (CANH / CANL)
+                                                            |
+                                                       [CAN XCVR]
+                                                            |
+                                                      +-----------+
+                                                      |  MASTER   | decode + print + monitor
+                                                      +-----------+
 
 Every node runs its own firmware and sends fixed-format 8-byte frames at a
 fixed rate. The Master never polls the slaves; it only listens.
